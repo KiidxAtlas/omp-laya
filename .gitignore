@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+laya-server.log
+.venv/
+node_modules/
