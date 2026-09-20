@@ -237,7 +237,13 @@ function layaSettings(pi: ExtensionAPI, cwd?: string): LayaSettings {
 	} catch {
 		return settings;
 	}
-	for (const source of [manager?.getGlobalSettings?.(), manager?.getProjectSettings?.()]) {
+	let sources: unknown[];
+	try {
+		sources = [manager?.getGlobalSettings?.(), manager?.getProjectSettings?.()];
+	} catch {
+		return settings;
+	}
+	for (const source of sources) {
 		if (!source || typeof source !== "object") continue;
 		const group = (source as Record<string, unknown>).laya;
 		if (!group || typeof group !== "object") continue;
