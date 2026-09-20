@@ -2,18 +2,32 @@
   "name": "omp-laya",
   "version": "0.1.1",
   "private": false,
-  "type": "module",
   "description": "Local Laya decision-policy extension for Oh My Pi",
+  "keywords": [
+    "agent",
+    "extension",
+    "laya",
+    "oh-my-pi",
+    "omp"
+  ],
   "license": "MIT",
-  "keywords": ["oh-my-pi", "omp", "extension", "laya", "agent"],
-  "omp": {
-    "extensions": ["./laya.ts"]
-  },
+  "files": [
+    "laya.ts",
+    "laya_server.py",
+    "requirements.txt",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
   "scripts": {
     "test": "bun test ./laya.test.mjs"
   },
-  "files": ["laya.ts", "laya_server.py", "requirements.txt", "README.md", "LICENSE"],
   "peerDependencies": {
     "@oh-my-pi/pi-coding-agent": ">=18"
+  },
+  "omp": {
+    "extensions": [
+      "./laya.ts"
+    ]
   }
 }
