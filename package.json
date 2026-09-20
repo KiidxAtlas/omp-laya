@@ -12,6 +12,7 @@
   "scripts": {
     "test": "bun test ./laya.test.mjs"
   },
+  "files": ["laya.ts", "laya_server.py", "requirements.txt", "README.md", "LICENSE"],
   "peerDependencies": {
     "@oh-my-pi/pi-coding-agent": ">=18"
   }
