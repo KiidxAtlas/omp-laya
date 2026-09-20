@@ -211,17 +211,16 @@ const DEFAULT_LAYA_SETTINGS: Readonly<LayaSettings> = {
 	synthesisReadBudget: SYNTHESIS_READ_BUDGET,
 };
 
+type LayaSettingsSource = {
+	getGlobalSettings?(): unknown;
+	getProjectSettings?(): unknown;
+};
+
 type LayaSettingsBridge = {
 	SettingsManager?: {
-		create(cwd?: string): {
-			getGlobalSettings?(): unknown;
-			getProjectSettings?(): unknown;
-		};
+		create(cwd?: string): LayaSettingsSource;
 	};
-	settings?: {
-		getGlobalSettings?(): unknown;
-		getProjectSettings?(): unknown;
-	};
+	settings?: LayaSettingsSource;
 };
 
 /**
@@ -230,9 +229,14 @@ type LayaSettingsBridge = {
  * binary before it gains those schema entries.
  */
 function layaSettings(pi: ExtensionAPI, cwd?: string): LayaSettings {
-	const bridge = pi.pi as unknown as LayaSettingsBridge | undefined;
-	const manager = bridge?.SettingsManager?.create(cwd) ?? bridge?.settings;
 	const settings: LayaSettings = { ...DEFAULT_LAYA_SETTINGS };
+	let manager: LayaSettingsSource | undefined;
+	try {
+		const bridge = pi.pi as unknown as LayaSettingsBridge | undefined;
+		manager = bridge?.SettingsManager?.create(cwd) ?? bridge?.settings;
+	} catch {
+		return settings;
+	}
 	for (const source of [manager?.getGlobalSettings?.(), manager?.getProjectSettings?.()]) {
 		if (!source || typeof source !== "object") continue;
 		const group = (source as Record<string, unknown>).laya;
