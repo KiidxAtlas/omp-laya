@@ -1639,8 +1639,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 		}),
 	);
 
-	if (layaSettings(pi).enabled && layaSettings(pi).toolsEnabled)
-		pi.registerTool({
+	pi.registerTool({
 			name: "laya_analyze",
 			label: "Laya Analysis",
 			description:
@@ -1684,8 +1683,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 			},
 		});
 
-	if (layaSettings(pi).enabled && layaSettings(pi).toolsEnabled)
-		pi.registerTool({
+	pi.registerTool({
 			name: "laya_decide",
 			label: "Laya Decision",
 			description: "Run one fast yes/no judgment with the local Laya decision model.",
