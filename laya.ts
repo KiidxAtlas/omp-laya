@@ -4,10 +4,31 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 const LAYA_URL = "http://127.0.0.1:8001/v1/predict";
 const LAYA_HEALTH_URL = "http://127.0.0.1:8001/health";
+const LAYA_SYSTEMONE_PROVIDER = "laya-systemone";
+const LAYA_SYSTEMONE_API = "laya-systemone";
+const LAYA_SYSTEMONE_BASE_URL = "http://127.0.0.1:8001/v1";
+/** Transcript cards shown to the user; never part of the model's context. */
+const LAYA_CARD_TYPE = "Laya";
+const LAYA_JUDGE_CRITERIA = {
+	"0": "Incorrect or fails the request.",
+	"1": "Major problems; only a small part is correct.",
+	"2": "Mostly correct; minor omissions or issues.",
+	"3": "Fully correct, relevant, and complete.",
+};
+const LAYA_CORRECTNESS_CRITERIA = {
+	true: "The answer is correct and fully satisfies the request.",
+	false: "The answer is wrong, irrelevant, or incomplete.",
+};
+const LAYA_CORRECTNESS_THRESHOLD = 0.6;
+const LAYA_MAX_RUBRIC_CHARS = 512;
+const LAYA_JUDGE_INSTRUCTIONS =
+	"Judge the assistant response in the supplied conversation for correctness, relevance, and completeness.";
 const LAYA_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const LAYA_AGENT_DIRECTORY = process.env.PI_CODING_AGENT_DIR ?? path.join(process.env.HOME ?? "", ".omp", "agent");
 const LAYA_PYTHON = process.env.LAYA_PYTHON ?? path.join(LAYA_AGENT_DIRECTORY, "laya-venv", "bin", "python");
@@ -31,7 +52,9 @@ const ECONOMY_BUDGET_MS = 1_000;
 const READ_REREAD_NUDGE = 3;
 const SYNTHESIS_READ_LIMIT = 3;
 const SYNTHESIS_READ_BUDGET = 32;
-const MAX_TRACKED_READS = 256;
+// Rewriting a message invalidates the provider prompt cache from that point
+// on; below this size the rewrite costs more than the tokens it removes.
+const MIN_PRUNABLE_RESULT_CHARS = 2_000;
 // A guard must be informative without becoming visible latency on every edit.
 const LAYA_OPERATION_TIMEOUT_MS = 800;
 const RISK_HOLD_THRESHOLD = 0.7;
@@ -95,11 +118,14 @@ const CLAIM_PATTERN =
 	/\b(?:i\s+)?(ran|tested|verified|confirmed|validated|reproduced|double-checked|smoke[-\s]?tested)\b|\b(tests?|suite|build|typecheck|lint)\s+(?:now\s+)?(pass(?:es|ed)?|green|clean|succeed(?:s|ed)?)\b|\ball\s+\d+\s+tests?\s+pass|\bno diagnostics\b/i;
 const HEDGE_PATTERN =
 	/\b(should|would|ought|expects?|presumably|probably|likely|if you|once you|you can|you should|please run|untested|pending|couldn't|could not|unable to|have not|haven't|did not|didn't|not (?:yet )?(?:tested|verified|run))\b/i;
-/** Commands that constitute real verification when they actually execute. */
+/** Only direct verification commands can automatically satisfy the ledger. */
 const VERIFICATION_COMMAND =
-	/\b(pytest|jest|vitest|mocha|rspec|phpunit|tsc|mypy|ruff|eslint|biome|luac|gradlew?|ctest)\b|\b(bun|npm|yarn|pnpm|cargo|go|make|dotnet|swift)\s+(test|check|build|lint|typecheck)\b|\bnpm\s+run\s+(test|build|lint|typecheck)\b|--noEmit\b/i;
+	/^(?:(?:pytest|jest|vitest|mocha|rspec|phpunit|tsc|mypy|ruff|eslint|biome|luac|gradlew?|ctest)(?=\s|$)|(?:bun|npm|yarn|pnpm|cargo|go|make|dotnet|swift)\s+(?:test|check|build|lint|typecheck)(?=\s|$)|npm\s+run\s+(?:test|build|lint|typecheck)(?=\s|$))/i;
 
 const STATE_CHANGING_TOOLS: Record<string, true> = { bash: true, edit: true, write: true };
+// Every other tool (eval, task, wait, ast_edit, …) may mutate files, so only
+// these certify that previously gathered evidence is still current.
+const READ_ONLY_TOOLS: Record<string, true> = { read: true, grep: true, glob: true };
 const SKIPPED_DIRECTORIES: Record<string, true> = {
 	".git": true,
 	node_modules: true,
@@ -143,12 +169,17 @@ type LayaQuestion = {
 
 type QuestionSet = Record<string, LayaQuestion>;
 
+type LayaProfile = "savings" | "balanced" | "safety-first";
+
 type LayaSettings = {
 	enabled: boolean;
 	serviceEnabled: boolean;
 	statusEnabled: boolean;
 	toolsEnabled: boolean;
 	economyEnabled: boolean;
+	modelRoutingEnabled: boolean;
+	contextBudgetEnabled: boolean;
+	profile: LayaProfile;
 	synthesisGuardEnabled: boolean;
 	contextPruningEnabled: boolean;
 	pathRepairEnabled: boolean;
@@ -201,6 +232,9 @@ const DEFAULT_LAYA_SETTINGS: Readonly<LayaSettings> = {
 	statusEnabled: true,
 	toolsEnabled: true,
 	economyEnabled: true,
+	modelRoutingEnabled: true,
+	contextBudgetEnabled: true,
+	profile: "balanced",
 	synthesisGuardEnabled: true,
 	contextPruningEnabled: true,
 	pathRepairEnabled: true,
@@ -248,6 +282,13 @@ function layaSettings(pi: ExtensionAPI, cwd?: string): LayaSettings {
 		const group = (source as Record<string, unknown>).laya;
 		if (!group || typeof group !== "object") continue;
 		const values = group as Record<string, unknown>;
+		if (typeof values.modelRoutingEnabled === "boolean")
+			settings.modelRoutingEnabled = values.modelRoutingEnabled;
+		if (typeof values.contextBudgetEnabled === "boolean")
+			settings.contextBudgetEnabled = values.contextBudgetEnabled;
+		if (values.profile === "savings" || values.profile === "balanced" || values.profile === "safety-first") {
+			settings.profile = values.profile;
+		}
 		if (typeof values.enabled === "boolean") settings.enabled = values.enabled;
 		if (typeof values.serviceEnabled === "boolean") settings.serviceEnabled = values.serviceEnabled;
 		if (typeof values.statusEnabled === "boolean") settings.statusEnabled = values.statusEnabled;
@@ -274,16 +315,17 @@ function layaSettings(pi: ExtensionAPI, cwd?: string): LayaSettings {
 function setLayaStatus(ctx: LayaUiContext, settings: LayaSettings, text: string | undefined): void {
 	if (settings.statusEnabled) ctx.ui.setStatus("laya", text);
 }
-const DIFFICULTY_CRITERIA = [
-	"trivial: lookup or one-liner",
-	"easy: short answer or small isolated change",
-	"moderate: several steps or files",
-	"hard: large multi-step reasoning or specialist knowledge",
-];
+type Difficulty = "trivial" | "easy" | "moderate" | "hard";
+
 const DIFFICULTY_QUESTION: LayaQuestion = {
-	type: "score",
+	type: "choice",
 	instructions: "How difficult is this request for a coding agent?",
-	criteria: DIFFICULTY_CRITERIA,
+	criteria: {
+		trivial: "Lookup, explanation, or one-liner requiring no meaningful reasoning.",
+		easy: "Short answer or small isolated change.",
+		moderate: "Several steps, multiple files, or nontrivial debugging.",
+		hard: "Large multi-step reasoning, high consequence, or specialist knowledge.",
+	},
 };
 
 type RetrievalMode = "none" | "targeted" | "explore";
@@ -291,6 +333,8 @@ type RetrievalMode = "none" | "targeted" | "explore";
 type EconomyDecision = {
 	retrieval?: RetrievalMode;
 	synthesis: boolean;
+	difficulty?: Difficulty;
+	sensitive?: boolean;
 };
 
 const ECONOMY_QUESTIONS = {
@@ -309,7 +353,84 @@ const ECONOMY_QUESTIONS = {
 		instructions:
 			"Is the user asking for a document or summary that synthesizes the existing project, rather than asking to change its behavior?",
 	},
+	difficulty: DIFFICULTY_QUESTION,
+	sensitive: {
+		type: "noul",
+		instructions:
+			"Does this request handle credentials, private personal data, security-sensitive information, or a high-impact safety decision?",
+	},
 } satisfies QuestionSet;
+
+type ContextUsageSnapshot = { tokens: number; contextWindow: number; percent: number; pressurePercent?: number };
+type ContextBudgetCaps = {
+	discovery: number;
+	synthesisReadLimit: number;
+	synthesisReadBudget: number;
+};
+
+const CONTEXT_PRESSURE_PERCENT = 70;
+const CONTEXT_BUDGET_CAPS: Record<LayaProfile, ContextBudgetCaps> = {
+	savings: { discovery: 1, synthesisReadLimit: 1, synthesisReadBudget: 12 },
+	balanced: { discovery: 2, synthesisReadLimit: 2, synthesisReadBudget: 20 },
+	"safety-first": { discovery: 3, synthesisReadLimit: 3, synthesisReadBudget: 32 },
+};
+
+function pressuredContextUsage(usage: unknown): ContextUsageSnapshot | undefined {
+	if (!usage || typeof usage !== "object") return undefined;
+	const value = usage as Record<string, unknown>;
+	const tokens = value.tokens;
+	const contextWindow = value.contextWindow;
+	const percent = value.percent;
+	if (
+		typeof tokens !== "number" ||
+		!Number.isFinite(tokens) ||
+		tokens <= 0 ||
+		typeof contextWindow !== "number" ||
+		!Number.isFinite(contextWindow) ||
+		contextWindow <= 0 ||
+		typeof percent !== "number" ||
+		!Number.isFinite(percent) ||
+		percent < 0
+	) {
+		return undefined;
+	}
+	const pressurePercent = Math.max(percent, (tokens / contextWindow) * 100);
+	return pressurePercent >= CONTEXT_PRESSURE_PERCENT
+		? { tokens, contextWindow, percent, pressurePercent }
+		: undefined;
+}
+
+function validDifficulty(value: string | undefined): value is Difficulty {
+	return value === "trivial" || value === "easy" || value === "moderate" || value === "hard";
+}
+
+function requestedRoute(profile: LayaProfile, difficulty: Difficulty, sensitive: boolean): "smol" | "slow" | undefined {
+	if (difficulty === "hard" && (profile === "savings" || profile === "safety-first")) return "slow";
+	if (profile === "safety-first" && sensitive) return "slow";
+	// Only the explicit savings profile trades quality for cost on a classifier guess.
+	if (profile === "savings" && !sensitive && (difficulty === "trivial" || difficulty === "easy")) return "smol";
+	return undefined;
+}
+
+const EFFORT_RANK: Record<string, number> = { off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
+
+/**
+ * Effort recommendation for `model` at `difficulty`. For the active model,
+ * recommend only an increase above the user's current level.
+ */
+function supportedEffort(
+	model: unknown,
+	difficulty: Difficulty,
+	currentLevel?: string,
+): "low" | "medium" | "high" | undefined {
+	if (!model || typeof model !== "object") return undefined;
+	const value = model as { reasoning?: unknown; thinking?: { efforts?: unknown } };
+	if (value.reasoning !== true || !Array.isArray(value.thinking?.efforts)) return undefined;
+	const effort = difficulty === "trivial" || difficulty === "easy" ? "low" : difficulty === "moderate" ? "medium" : "high";
+	if (!value.thinking.efforts.includes(effort)) return undefined;
+	if (currentLevel !== undefined && (EFFORT_RANK[currentLevel] ?? Infinity) >= EFFORT_RANK[effort]!) return undefined;
+	return effort;
+}
 
 const ANALYSIS_QUESTIONS = {
 	security: {
@@ -477,40 +598,24 @@ function splitSelector(rawPath: string): { file: string; selector: string } {
 	return { file: rawPath.slice(0, marker), selector: rawPath.slice(marker) };
 }
 
-type ReadRange = { start: number; end: number | undefined };
-
-/**
- * Parse only selectors whose line coverage is exact. Unknown forms stay in
- * context rather than risking a loss of source lines.
- */
-function readRange(selector: string): ReadRange | undefined {
-	if (selector === "" || selector === ":raw") return { start: 1, end: undefined };
-	const match = selector.match(/^:(\d+)(?:-(\d*)|\+(\d+))?(?::raw)?$/);
-	if (!match?.[1]) return undefined;
-	const start = Number(match[1]);
-	if (!Number.isSafeInteger(start) || start < 1) return undefined;
-	if (match[3]) {
-		const count = Number(match[3]);
-		return Number.isSafeInteger(count) && count > 0 ? { start, end: start + count - 1 } : undefined;
-	}
-	if (match[2] === "") return { start, end: undefined };
-	if (match[2]) {
-		const end = Number(match[2]);
-		return Number.isSafeInteger(end) && end >= start ? { start, end } : undefined;
-	}
-	return { start, end: undefined };
-}
-
 type ReadTarget = {
 	file: string;
-	range?: ReadRange;
+	/** File plus selector: the identity of one specific read. */
+	readKey: string;
 	stateVersion: number;
 };
 
-type ReadSnapshot = ReadTarget & {
-	toolCallId: string;
-	outputChars: number;
-};
+/** Full text of an all-text result; undefined when any part (e.g. an image) is not text. */
+function fullTextOf(content: unknown): string | undefined {
+	if (!Array.isArray(content)) return undefined;
+	const parts: string[] = [];
+	for (const part of content) {
+		if (!part || typeof part !== "object" || !("text" in part) || typeof part.text !== "string") return undefined;
+		parts.push(part.text);
+	}
+	return parts.join("\n");
+}
+
 
 /**
  * Front-load the fields that carry the risk signal (tool, path, command) and
@@ -527,13 +632,14 @@ function summarizeProposal(toolName: string, input: object): string {
 	return `${lead.join(" ")}\n${rest.slice(0, MAX_PROPOSAL_CHARS)}`;
 }
 
+/**
+ * Repository-wide file listing. Grep is not broad: its pattern is the most
+ * targeted way to locate a symbol, and holding it pushes the agent to guess.
+ */
 function isBroadExploration(toolName: string, input: object): boolean {
-	if (toolName !== "glob" && toolName !== "grep") return false;
+	if (toolName !== "glob") return false;
 	const target = "path" in input && typeof input.path === "string" ? input.path.trim() : "";
-	if (toolName === "glob") {
-		return target === "" || target === "." || target === "./" || target.includes("**");
-	}
-	return target === "" || target === "." || target === "./";
+	return target === "" || target === "." || target === "./" || target.includes("**");
 }
 
 /**
@@ -554,6 +660,15 @@ function answersOf(result: unknown): Record<string, unknown> | undefined {
 function probabilityOf(result: unknown, key: string): number {
 	const answer = answersOf(result)?.[key];
 	return answer && typeof answer === "object" && "noul" in answer && typeof answer.noul === "number" ? answer.noul : 0;
+}
+
+function optionalProbabilityOf(result: unknown, key: string): number | undefined {
+	const answer = answersOf(result)?.[key];
+	if (!answer || typeof answer !== "object" || !("noul" in answer)) return undefined;
+	const probability = answer.noul;
+	return typeof probability === "number" && Number.isFinite(probability) && probability >= 0 && probability <= 1
+		? probability
+		: undefined;
 }
 
 /** Read one `choice` result out of a Laya response. */
@@ -593,7 +708,7 @@ async function layaProbe(): Promise<{ device: string }> {
 	return health;
 }
 
-async function launchLayaProcess(): Promise<number | undefined> {
+async function launchLayaProcess(): Promise<void> {
 	await fs.access(LAYA_PYTHON);
 	const log = await fs.open(LAYA_LOG_PATH, "a");
 	try {
@@ -602,8 +717,19 @@ async function launchLayaProcess(): Promise<number | undefined> {
 			["-m", "uvicorn", "laya_server:app", "--host", "127.0.0.1", "--port", "8001", "--log-level", "info"],
 			{ cwd: LAYA_DIRECTORY, detached: true, stdio: ["ignore", log.fd, log.fd] },
 		);
+		await new Promise<void>((resolve, reject) => {
+			const onSpawn = () => {
+				child.off("error", onError);
+				resolve();
+			};
+			const onError = (error: Error) => {
+				child.off("spawn", onSpawn);
+				reject(error);
+			};
+			child.once("spawn", onSpawn);
+			child.once("error", onError);
+		});
 		child.unref();
-		return child.pid;
 	} finally {
 		await log.close();
 	}
@@ -741,7 +867,160 @@ function assistantText(message: unknown): string {
 	return text;
 }
 
+function layaSystemOneRequest(context: Context): {
+	model: string;
+	state: Array<{ role: string; content: string }>;
+	questions: Record<string, unknown>;
+} {
+	const messageTexts = context.messages.map(message => ({
+		role: String(message.role),
+		content: assistantText(message).trim(),
+	}));
+	const explicitRubric = messageTexts
+		.filter(message => message.role === "system" || message.role === "developer")
+		.map(message => message.content)
+		.filter(Boolean)
+		.join("\n\n");
+	const inheritedPrompt = (context.systemPrompt ?? []).filter(Boolean).join("\n\n");
+	const rubric =
+		explicitRubric.length > 0 && explicitRubric.length <= LAYA_MAX_RUBRIC_CHARS
+			? explicitRubric
+			: explicitRubric.length === 0 && inheritedPrompt.length <= LAYA_MAX_RUBRIC_CHARS
+				? inheritedPrompt
+				: "";
+	const state = messageTexts.filter(
+		message => message.role !== "system" && message.role !== "developer" && message.content.length > 0,
+	);
+	if (state.length === 0) state.push({ role: "user", content: rubric || LAYA_JUDGE_INSTRUCTIONS });
+
+	const instructions = rubric || LAYA_JUDGE_INSTRUCTIONS;
+	return {
+		model: "convaiinnovations/laya-typed-decisions",
+		state,
+		questions: {
+			judge: {
+				type: "choice",
+				instructions,
+				criteria: LAYA_JUDGE_CRITERIA,
+			},
+			correctness: {
+				type: "noul",
+				instructions:
+					"Is the answer factually correct and does it satisfy every explicit requirement? " +
+					"Answer true only if both conditions hold, otherwise false.",
+				criteria: LAYA_CORRECTNESS_CRITERIA,
+			},
+		},
+	};
+}
+
+function layaAssistantMessage(model: Model<Api>): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
+function streamLayaSystemOne(
+	model: Model<Api>,
+	context: Context,
+	options?: SimpleStreamOptions,
+) {
+	const stream = createAssistantMessageEventStream();
+	void (async () => {
+		const message = layaAssistantMessage(model);
+		try {
+			await ensureLayaReady();
+			const baseUrl = (model.baseUrl || LAYA_SYSTEMONE_BASE_URL).replace(/\/+$/, "");
+			const response = await fetch(`${baseUrl}/systemone`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(layaSystemOneRequest(context)),
+				signal: options?.signal,
+			});
+			if (!response.ok) {
+				throw new Error(`Laya System One returned HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
+			}
+
+			const result = await response.json();
+			const judge = result?.answers?.judge;
+			const correctness = result?.answers?.correctness;
+			const rawScore = Number(judge?.choice);
+			const correctnessProbability = Number(correctness?.noul);
+			const confidence = Math.min(Number(judge?.confidence), Number(correctness?.confidence));
+			if (
+				!Number.isInteger(rawScore) ||
+				rawScore < 0 ||
+				rawScore > 3 ||
+				!Number.isFinite(correctnessProbability) ||
+				!Number.isFinite(confidence)
+			) {
+				throw new Error("Laya System One returned an invalid judge prediction");
+			}
+
+			const score =
+				correctnessProbability >= LAYA_CORRECTNESS_THRESHOLD ? rawScore : Math.min(rawScore, 1);
+			const content = JSON.stringify({
+				score,
+				raw_score: rawScore,
+				confidence: Math.round(confidence * 10_000) / 10_000,
+				correctness_probability: Math.round(correctnessProbability * 10_000) / 10_000,
+				probabilities: judge.probabilities,
+			});
+			message.content.push({ type: "text", text: content });
+			message.usage.input = Number(result?.usage?.input_tokens) || 0;
+			message.usage.totalTokens = message.usage.input;
+			message.duration = Date.now() - message.timestamp;
+			stream.push({ type: "start", partial: message });
+			stream.push({ type: "text_start", contentIndex: 0, partial: message });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: content, partial: message });
+			stream.push({ type: "text_end", contentIndex: 0, content, partial: message });
+			stream.push({ type: "done", reason: "stop", message });
+		} catch (error) {
+			const reason = options?.signal?.aborted ? "aborted" : "error";
+			message.stopReason = reason;
+			message.errorMessage = error instanceof Error ? error.message : String(error);
+			message.duration = Date.now() - message.timestamp;
+			stream.push({ type: "start", partial: message });
+			stream.push({ type: "error", reason, error: message });
+		}
+	})();
+	return stream;
+}
+
 export default function layaControlPlane(pi: ExtensionAPI) {
+	pi.registerProvider(LAYA_SYSTEMONE_PROVIDER, {
+		api: LAYA_SYSTEMONE_API,
+		baseUrl: LAYA_SYSTEMONE_BASE_URL,
+		apiKey: "N/A", // OMP's no-auth sentinel; the custom transport never sends it.
+		auth: "none",
+		models: [
+			{
+				id: "laya",
+				name: "Laya Judge (System One)",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1024,
+				maxTokens: 128,
+			},
+		],
+		streamSimple: streamLayaSystemOne,
+	});
+
 	const z = pi.zod;
 	const surfacedActivities = new Set<string>();
 
@@ -752,7 +1031,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 		surfacedActivities.add(phase);
 		pi.sendMessage(
 			{
-				customType: "Laya",
+				customType: LAYA_CARD_TYPE,
 				content: `**${warning ? "⚠ " : ""}${title}**\n\n${detail}`,
 				display: true,
 				details: { phase, warning },
@@ -805,7 +1084,6 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 	let stateVersion = 0;
 	let layaOnline = false;
 	let layaFailures = 0;
-	let verificationRanThisTurn = false;
 	let verificationRequiredThisTurn = false;
 	const verificationReasons = new Set<string>();
 	let verificationLedger: MutationVerificationLedger = {
@@ -825,10 +1103,77 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 	let heldBroadExplorations = 0;
 	const readTargets = new Map<string, ReadTarget>();
 	const fileReads = new Map<string, { count: number; nudged: boolean; stateVersion: number }>();
-	const readSnapshots: ReadSnapshot[] = [];
-	const supersededReadResults = new Map<string, string>();
 	let prunedReadResults = 0;
 	let prunedReadChars = 0;
+	let prunedEstimatedTokens = 0;
+	const sessionMetrics = {
+		turns: 0,
+		providerInputTokens: 0,
+		providerOutputTokens: 0,
+		cacheReadTokens: 0,
+		cacheWriteTokens: 0,
+		inferenceCount: 0,
+		inferenceLatencyMs: 0,
+		blockedOperations: 0,
+		prunedOperations: 0,
+		prunedChars: 0,
+		estimatedPrunedTokens: 0,
+		routeAssessments: 0,
+		recommendationsToSmol: 0,
+		recommendationsToSlow: 0,
+		noRoleRecommendations: 0,
+		explicitUserBypasses: 0,
+	};
+	let latestContextUsage: ContextUsageSnapshot | undefined;
+	let contextPressureActive = false;
+	let effectiveSynthesisReadLimit = SYNTHESIS_READ_LIMIT;
+	let effectiveSynthesisReadBudget = SYNTHESIS_READ_BUDGET;
+	let turnInferenceCount = 0;
+	let turnInferenceLatencyMs = 0;
+	let turnBlockedOperations = 0;
+	let turnRouteRecommendation: Record<string, unknown> | undefined;
+	let keepModelNextTurn = false;
+	let explicitPathMentions = new Set<string>();
+	const prunedResultIds = new Set<string>();
+
+	async function infer(text: string, questions: QuestionSet, signal?: AbortSignal): Promise<unknown> {
+		const startedAt = performance.now();
+		try {
+			return await requestLaya(text, questions, signal);
+		} finally {
+			sessionMetrics.inferenceCount += 1;
+			const elapsedMs = Math.max(0, performance.now() - startedAt);
+			sessionMetrics.inferenceLatencyMs += elapsedMs;
+			turnInferenceCount += 1;
+			turnInferenceLatencyMs += elapsedMs;
+		}
+	}
+
+	function recordPrunedOutput(toolCallId: string, chars: number): void {
+		if (prunedResultIds.has(toolCallId)) return;
+		prunedResultIds.add(toolCallId);
+		const outputChars = Math.max(0, chars);
+		prunedReadResults += 1;
+		prunedReadChars += outputChars;
+		sessionMetrics.prunedOperations += 1;
+		sessionMetrics.prunedChars += outputChars;
+		sessionMetrics.estimatedPrunedTokens += Math.ceil(outputChars / 4);
+		prunedEstimatedTokens += Math.ceil(outputChars / 4);
+	}
+
+	function pathExplicitlyNamed(rawPath: string, cwd: string): boolean {
+		const selectedPath = splitSelector(rawPath).file.replace(/\\/g, "/").toLowerCase();
+		const relative = path.relative(cwd, path.resolve(cwd, selectedPath)).replace(/\\/g, "/").toLowerCase();
+		return Array.from(explicitPathMentions).some(mention => {
+			const normalized = splitSelector(mention).file.replace(/\\/g, "/").toLowerCase();
+			return (
+				relative === normalized ||
+				relative.endsWith(`/${normalized}`) ||
+				(!normalized.includes("/") && path.basename(relative) === normalized)
+			);
+		});
+	}
+
 
 	function isVerificationPending(): boolean {
 		return (
@@ -871,7 +1216,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 	async function cachedClaimScore(text: string): Promise<number> {
 		if (!layaOnline) return 0;
 		try {
-			const result = await requestLaya(
+			const result = await infer(
 				text,
 				{
 					claim: {
@@ -890,12 +1235,16 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 	async function classifyEconomy(text: string): Promise<EconomyDecision | undefined> {
 		if (!layaOnline) return undefined;
 		try {
-			const result = await requestLaya(text, ECONOMY_QUESTIONS, AbortSignal.timeout(CONTROL_TIMEOUT_MS));
+			const result = await infer(text, ECONOMY_QUESTIONS, AbortSignal.timeout(CONTROL_TIMEOUT_MS));
 			const retrieval = choiceOf(result, "retrieval");
+			const difficulty = choiceOf(result, "difficulty");
+			const sensitivity = optionalProbabilityOf(result, "sensitive");
 			layaFailures = 0;
 			return {
 				...(retrieval === "none" || retrieval === "targeted" || retrieval === "explore" ? { retrieval } : {}),
 				synthesis: probabilityOf(result, "synthesis") >= 0.6,
+				...(validDifficulty(difficulty) ? { difficulty } : {}),
+				...(sensitivity === undefined ? {} : { sensitive: sensitivity >= RISK_HOLD_THRESHOLD }),
 			};
 		} catch {
 			layaFailures += 1;
@@ -912,7 +1261,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 	): Promise<ChangeAssessment | undefined> {
 		if (!layaOnline) return undefined;
 		try {
-			const result = await requestLaya(
+			const result = await infer(
 				summarizeProposal(toolName, input),
 				CHANGE_QUESTIONS,
 				AbortSignal.timeout(LAYA_OPERATION_TIMEOUT_MS),
@@ -1008,7 +1357,11 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 	pi.on("input", async (event, ctx) => {
 		const settings = layaSettings(pi, ctx.cwd);
 		surfacedActivities.clear();
-		verificationRanThisTurn = false;
+		if (ctx.hasUI) ctx.ui.setWidget?.("laya-activity", undefined);
+		setLayaStatus(ctx, settings, undefined);
+		explicitPathMentions = new Set(event.text.match(MENTIONED_PATH) ?? []);
+		// The user may have edited files between turns; earlier evidence is no longer certified current.
+		stateVersion += 1;
 		verificationRequiredThisTurn = false;
 		verificationReasons.clear();
 		verificationCalls.clear();
@@ -1022,20 +1375,39 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 		changeAssessments.clear();
 		broadExplorationBudget = undefined;
 		retrievalMode = undefined;
+		turnBlockedOperations = 0;
+		turnInferenceCount = 0;
+		turnInferenceLatencyMs = 0;
+		turnRouteRecommendation = undefined;
+		prunedReadResults = 0;
+		prunedReadChars = 0;
+		prunedEstimatedTokens = 0;
+		effectiveSynthesisReadLimit = settings.synthesisReadLimit;
+		effectiveSynthesisReadBudget = settings.synthesisReadBudget;
+		const inputContextUsage = ctx.getContextUsage();
+		latestContextUsage = inputContextUsage
+			? {
+					tokens: inputContextUsage.tokens,
+					contextWindow: inputContextUsage.contextWindow,
+					percent: inputContextUsage.percent,
+				}
+			: undefined;
+		contextPressureActive = settings.contextBudgetEnabled && pressuredContextUsage(inputContextUsage) !== undefined;
 		synthesisMode =
 			settings.enabled &&
-			settings.economyEnabled &&
 			settings.synthesisGuardEnabled &&
+			(settings.economyEnabled || settings.contextBudgetEnabled) &&
 			SYNTHESIS_PROMPT.test(event.text);
 		synthesisReadCount = 0;
 		heldSynthesisReads = 0;
 		heldBroadExplorations = 0;
-		prunedReadResults = 0;
-		prunedReadChars = 0;
 		fileReads.clear();
-		if (!settings.enabled || !settings.economyEnabled) {
+		const shouldClassify =
+			settings.enabled &&
+			(settings.economyEnabled || settings.modelRoutingEnabled || contextPressureActive);
+		if (!shouldClassify) {
 			pendingEconomy = undefined;
-			setLayaStatus(ctx, settings, settings.enabled ? "Economy disabled" : "Disabled");
+			setLayaStatus(ctx, settings, settings.enabled ? "Advisory disabled" : "Disabled");
 			return;
 		}
 		if (!layaOnline) {
@@ -1043,32 +1415,65 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 			setLayaStatus(ctx, settings, "Unavailable");
 			return;
 		}
-		setLayaStatus(ctx, settings, "Classifying retrieval");
-		pi.logger.debug("laya classifying turn economy", { chars: event.text.length });
+		setLayaStatus(ctx, settings, "Classifying turn");
+		pi.logger.debug("laya classifying turn economy and routing", { chars: event.text.length });
 		// Indexing scans up to 20,000 files. Defer it until the user actually
 		// named a path that needs recovery rather than paying it on every turn.
-		if ((event.text.match(MENTIONED_PATH) ?? []).length > 0) void indexRepository(ctx.cwd).catch(() => undefined);
+		if (explicitPathMentions.size > 0) void indexRepository(ctx.cwd).catch(() => undefined);
 		pendingEconomy = classifyEconomy(event.text);
-	});
-
-	pi.on("turn_start", async () => {
-		verificationRanThisTurn = false;
 	});
 
 	pi.on("before_agent_start", async (event, ctx) =>
 		guarded("before_agent_start", ctx, async () => {
 			const settings = layaSettings(pi, ctx.cwd);
-			if (!settings.enabled) return;
+			const bypassRequested = keepModelNextTurn;
+			keepModelNextTurn = false;
+			if (!settings.enabled) {
+				if (bypassRequested) {
+					sessionMetrics.explicitUserBypasses += 1;
+					pi.appendEntry("laya-routing", {
+						decision: "bypass",
+						advisory: true,
+						reason: "Explicit /laya keep-model request; Laya is disabled, so no recommendation was active.",
+						timestamp: Date.now(),
+					});
+				}
+				return;
+			}
+
 			const notes: string[] = [];
+			explicitPathMentions = new Set(event.prompt.match(MENTIONED_PATH) ?? []);
+			const usage = ctx.getContextUsage();
+			latestContextUsage = usage
+				? { tokens: usage.tokens, contextWindow: usage.contextWindow, percent: usage.percent }
+				: undefined;
+			const pressureUsage = settings.contextBudgetEnabled ? pressuredContextUsage(usage) : undefined;
+			contextPressureActive = pressureUsage !== undefined;
+			const contextCaps = contextPressureActive ? CONTEXT_BUDGET_CAPS[settings.profile] : undefined;
+			effectiveSynthesisReadLimit = Math.min(
+				settings.synthesisReadLimit,
+				contextCaps?.synthesisReadLimit ?? settings.synthesisReadLimit,
+			);
+			effectiveSynthesisReadBudget = Math.min(
+				settings.synthesisReadBudget,
+				contextCaps?.synthesisReadBudget ?? settings.synthesisReadBudget,
+			);
+
 			const economy =
-				settings.economyEnabled && pendingEconomy
+				(settings.economyEnabled || settings.modelRoutingEnabled || contextPressureActive) && pendingEconomy
 					? await withTimeout(pendingEconomy, ECONOMY_BUDGET_MS)
 					: undefined;
 			pendingEconomy = undefined;
-			synthesisMode ||= settings.economyEnabled && settings.synthesisGuardEnabled && economy?.synthesis === true;
-			if (settings.economyEnabled && economy?.retrieval) {
+			synthesisMode ||=
+				settings.synthesisGuardEnabled &&
+				(settings.economyEnabled || contextPressureActive) &&
+				economy?.synthesis === true;
+			if ((settings.economyEnabled || contextPressureActive) && economy?.retrieval) {
 				retrievalMode = economy.retrieval;
-				broadExplorationBudget = economy.retrieval === "explore" ? 3 : 0;
+				const discoveryCap = contextCaps?.discovery ?? 3;
+				// Only a "none" plan holds discovery; a targeted plan still has to locate its target.
+				broadExplorationBudget =
+					economy.retrieval === "explore" ? Math.min(3, discoveryCap) : economy.retrieval === "none" ? 0 : undefined;
 			}
 			if (economy?.retrieval || synthesisMode) {
 				const retrievalDetail =
@@ -1080,22 +1485,113 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 				const synthesisDetail = synthesisMode
 					? " Source reads are also bounded so the agent synthesizes rather than re-reads."
 					: "";
+				const budgetDetail = contextPressureActive
+					? ` Context pressure is active at ${Math.round(pressureUsage?.pressurePercent ?? 0)}%; the ${settings.profile} profile caps discovery at ${contextCaps?.discovery ?? 0}, source reads per file at ${effectiveSynthesisReadLimit}, and synthesis reads at ${effectiveSynthesisReadBudget}.`
+					: "";
 				recordActivity(ctx, settings, {
 					phase: "turn-plan",
 					title: "Laya plan",
-					detail: `${retrievalDetail}${synthesisDetail}`,
+					detail: `${retrievalDetail}${synthesisDetail}${budgetDetail}`,
 					status: [
 						"Plan",
 						economy?.retrieval ? `${economy.retrieval} retrieval` : undefined,
 						synthesisMode ? "synthesis" : undefined,
+						contextPressureActive ? "context pressure" : undefined,
 					]
 						.filter(Boolean)
 						.join(" · "),
-					transcript: true,
 				});
 			} else {
 				setLayaStatus(ctx, settings, layaOnline ? "Advisory delayed" : "Unavailable");
 			}
+
+			const currentModel = ctx.model ?? ctx.models.current();
+			const currentModelRef = currentModel ? `${currentModel.provider}/${currentModel.id}` : undefined;
+			let decision = settings.modelRoutingEnabled ? "no-recommendation" : "disabled";
+			let reason = settings.modelRoutingEnabled ? "Classification unavailable or incomplete." : "Model recommendations are disabled.";
+			let recommendedModel: typeof currentModel | undefined;
+			let recommendedEffort: "low" | "medium" | "high" | undefined;
+			if (bypassRequested) {
+				decision = "bypass";
+				reason = "Explicit one-shot /laya keep-model recommendation bypass.";
+			} else if (
+				settings.modelRoutingEnabled &&
+				economy !== undefined &&
+				validDifficulty(economy.difficulty) &&
+				typeof economy.sensitive === "boolean"
+			) {
+				const route = requestedRoute(settings.profile, economy.difficulty, economy.sensitive);
+				let selectedModel = currentModel;
+				let roleUnavailable = false;
+				if (route === "smol" || route === "slow") {
+					try {
+						selectedModel = route === "smol" ? ctx.models.resolve("@smol") : ctx.models.resolve("@slow");
+					} catch (error) {
+						recordFailure("model role resolution", error, ctx);
+						roleUnavailable = true;
+					}
+					if (!selectedModel) roleUnavailable = true;
+				}
+				if (roleUnavailable) {
+					decision = "unavailable";
+					reason = `The configured ${route === "smol" ? "@smol" : "@slow"} role is unavailable; the current model and effort are unchanged.`;
+				} else {
+					recommendedModel = selectedModel;
+					// An unknown current level is treated as the highest: never recommend lowering it.
+					const currentLevel = route ? undefined : (pi.getThinkingLevel?.() ?? "max");
+					recommendedEffort = supportedEffort(selectedModel, economy.sensitive ? "hard" : economy.difficulty, currentLevel);
+					decision = route ? `recommended-${route}` : "recommended-current";
+					reason = route
+						? `${settings.profile} profile recommends @${route} for ${economy.difficulty}${economy.sensitive ? " sensitive" : ""} work.`
+						: `${settings.profile} profile recommends the active model for ${economy.difficulty}${economy.sensitive ? " sensitive" : ""} work.`;
+				}
+			}
+
+			const routeEntry = {
+				decision,
+				reason,
+				profile: settings.profile,
+				difficulty: economy?.difficulty,
+				sensitive: economy?.sensitive,
+				advisory: true,
+				activeModel: currentModelRef,
+				activeThinkingLevel: pi.getThinkingLevel?.(),
+				recommendedModel: recommendedModel ? `${recommendedModel.provider}/${recommendedModel.id}` : undefined,
+				recommendedThinkingLevel: recommendedEffort,
+				contextPressure: contextPressureActive
+					? {
+							tokens: pressureUsage?.tokens,
+							contextWindow: pressureUsage?.contextWindow,
+							percent: pressureUsage?.percent,
+							pressurePercent: pressureUsage?.pressurePercent,
+						}
+					: undefined,
+			};
+			turnRouteRecommendation = routeEntry;
+			sessionMetrics.routeAssessments += 1;
+			if (decision === "recommended-smol") sessionMetrics.recommendationsToSmol += 1;
+			else if (decision === "recommended-slow") sessionMetrics.recommendationsToSlow += 1;
+			else sessionMetrics.noRoleRecommendations += 1;
+			if (bypassRequested) sessionMetrics.explicitUserBypasses += 1;
+			pi.appendEntry("laya-routing", { ...routeEntry, timestamp: Date.now() });
+			const routeTitle =
+				decision === "recommended-smol"
+					? "Recommended @smol"
+					: decision === "recommended-slow"
+						? "Recommended @slow"
+						: decision === "bypass"
+							? "Model recommendation bypassed once"
+							: decision === "unavailable"
+								? "Model recommendation unavailable"
+								: decision === "recommended-current"
+									? "Recommended current model"
+									: "No model recommendation";
+			recordActivity(ctx, settings, {
+				phase: `route:${sessionMetrics.routeAssessments}`,
+				title: routeTitle,
+				detail: `${reason} Advisory only: the active model and effort are unchanged.`,
+				status: decision === "bypass" ? "Recommendation bypassed" : `Advisory · ${decision}`,
+			});
 
 			const skills = matchSkills(event.prompt, parseSkills(ctx.getSystemPrompt()));
 			if (skills.length > 0) {
@@ -1103,14 +1599,23 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 				notes.push(`Matched skill instructions for this request: read ${named} before starting.`);
 			}
 
-			if ((event.prompt.match(MENTIONED_PATH) ?? []).length > 0) {
+			if (explicitPathMentions.size > 0) {
 				const mentioned = resolveMentioned(event.prompt, await indexRepository(ctx.cwd), ctx.cwd);
 				if (mentioned.length > 0) notes.push(`Paths named in the request resolve to: ${mentioned.join(", ")}.`);
 			}
 
-			if (notes.length === 0) return;
+			// A hidden message after the prompt, not a system-prompt override: changing
+			// the system prompt per turn invalidates the provider cache for the whole
+			// conversation that follows it.
+			const message =
+				notes.length > 0
+					? { customType: "laya-context", content: `<Laya context>\n${notes.join("\n")}\n</Laya context>`, display: false }
+					: undefined;
+			// The installed runner consumes only message/systemPrompt from this hook.
+			// Routing is advisory; do not return unsupported model/effort overrides.
+			if (!message) return;
 			pi.logger.info("laya context hints", { notes });
-			return { systemPrompt: [...event.systemPrompt, `\n<Laya context>\n${notes.join("\n")}\n</Laya context>`] };
+			return { message };
 		}),
 	);
 
@@ -1148,7 +1653,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 				{
 					customType: "laya-verification-enforcement",
 					content:
-						"[laya] A behavior-affecting mutation remains unverified. Run the narrowest relevant verification command before responding. Do not claim completion unless it succeeds; if it cannot run, state why.",
+						"[laya] No recognized successful verification command is recorded for the latest behavior-affecting mutation. Run the narrowest relevant check, or cite the command and observed result if you already verified another way. If verification cannot run, state why.",
 					display: false,
 					details: { requiredVersion, ledger: verificationLedger },
 				},
@@ -1158,15 +1663,15 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 	);
 
 	/**
-	 * Claim tripwire. The harness executed every tool this turn, so it — not the
-	 * model's summary — is the authority on whether verification actually ran.
+	 * Claim tripwire. Command recognition is incomplete, so missing evidence is
+	 * advisory, never proof that verification did not happen.
 	 */
 	pi.on("turn_end", async (event, ctx) =>
 		guarded("turn_end", ctx, async () => {
 			const settings = layaSettings(pi, ctx.cwd);
 			if (!settings.enabled || !settings.verificationEnabled) return;
 			const text = assistantText(event.message);
-			if (verificationRanThisTurn || !ctx.hasUI) return;
+			if ((verificationLedger.verifiedVersion ?? -1) >= verificationLedger.mutationVersion || !ctx.hasUI) return;
 			if (!text || HEDGE_PATTERN.test(text)) return;
 			let claimed = CLAIM_PATTERN.test(text);
 			if (!claimed) {
@@ -1177,12 +1682,12 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 				claimed = verdict >= CLAIM_RECALL_THRESHOLD;
 			}
 			if (!claimed) return;
-			ctx.ui.notify("This turn asserts work was verified, but no test, build, or typecheck ran.", "warning");
+			ctx.ui.notify("Laya has no recognized successful verification command for the current changes. If you verified another way, cite that evidence.", "warning");
 			recordActivity(ctx, settings, {
 				phase: "verification-claim",
-				title: "Unverified claim",
-				detail: "The response claims verification, but this turn ran no successful test, build, or typecheck.",
-				status: "Verification warning",
+				title: "Verification evidence not recognized",
+				detail: "The response claims verification, but Laya's command recognition may miss smoke checks or other evidence. Cite the check and observed result.",
+				status: "Verification advisory",
 				warning: true,
 				transcript: true,
 			});
@@ -1198,33 +1703,77 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 				recordActivity(ctx, settings, {
 					phase: "verification-pending",
 					title: "Verification still needed",
-					detail: `Mutation ${verificationLedger.requiredVersion} remains unverified${reasons.length > 0 ? ` (${reasons.join(", ")})` : ""}; no successful targeted check began after it.`,
+					detail: `Mutation ${verificationLedger.requiredVersion} has no recognized successful verification command${reasons.length > 0 ? ` (${reasons.join(", ")})` : ""}; other checks may not be recognized.`,
 					status: "Verification pending",
 					warning: true,
 					transcript: true,
 				});
 			}
-			if (!settings.economyEnabled) return;
-			const usage = event.message.usage;
-			if (!usage) return;
-			const inputTokens = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-			const outputTokens = usage.output ?? 0;
+			const providerUsage = event.message.usage;
+			const contextUsage = ctx.getContextUsage();
+			if (contextUsage) {
+				latestContextUsage = {
+					tokens: contextUsage.tokens,
+					contextWindow: contextUsage.contextWindow,
+					percent: contextUsage.percent,
+				};
+			}
+			sessionMetrics.turns += 1;
+			if (typeof providerUsage?.input === "number" && Number.isFinite(providerUsage.input))
+				sessionMetrics.providerInputTokens += providerUsage.input;
+			if (typeof providerUsage?.output === "number" && Number.isFinite(providerUsage.output))
+				sessionMetrics.providerOutputTokens += providerUsage.output;
+			if (typeof providerUsage?.cacheRead === "number" && Number.isFinite(providerUsage.cacheRead))
+				sessionMetrics.cacheReadTokens += providerUsage.cacheRead;
+			if (typeof providerUsage?.cacheWrite === "number" && Number.isFinite(providerUsage.cacheWrite))
+				sessionMetrics.cacheWriteTokens += providerUsage.cacheWrite;
+
+			const inputTokens = providerUsage?.input ?? null;
+			const outputTokens = providerUsage?.output ?? null;
+			const cacheReadTokens = providerUsage?.cacheRead ?? null;
+			const cacheWriteTokens = providerUsage?.cacheWrite ?? null;
+			const reportedPromptTokens =
+				inputTokens === null || cacheReadTokens === null || cacheWriteTokens === null
+					? null
+					: inputTokens + cacheReadTokens + cacheWriteTokens;
+			const reportedTotalTokens = providerUsage?.totalTokens ?? null;
 			pi.appendEntry("laya-economy", {
 				retrievalMode: retrievalMode ?? "unclassified",
 				synthesisMode,
 				synthesisReadCount,
 				heldSynthesisReads,
 				heldBroadExplorations,
-				prunedReadResults,
+				blockedOperations: turnBlockedOperations,
+				prunedOperations: prunedReadResults,
 				prunedReadChars,
+				prunedTokens: {
+					estimated: prunedEstimatedTokens,
+					method: "ceil(pruned output characters / 4)",
+				},
+				contextBudget: {
+					enabled: settings.contextBudgetEnabled,
+					active: contextPressureActive,
+					profile: settings.profile,
+				},
+				routeRecommendation: turnRouteRecommendation ?? null,
 				verificationRequired: isVerificationPending(),
 				verificationLedger,
-				usage: {
+				providerUsage: {
 					inputTokens,
 					outputTokens,
-					reasoningOutputTokens: usage.reasoningTokens ?? 0,
-					totalTokens: usage.totalTokens ?? inputTokens + outputTokens,
+					cacheReadTokens,
+					cacheWriteTokens,
+					reportedPromptTokens,
+					totalTokens: reportedTotalTokens,
+					reasoningOutputTokens: providerUsage?.reasoningTokens ?? null,
 				},
+				contextUsage: latestContextUsage ?? null,
+				layaInference: {
+					requests: turnInferenceCount,
+					latencyMs: turnInferenceLatencyMs,
+					averageLatencyMs: turnInferenceCount > 0 ? turnInferenceLatencyMs / turnInferenceCount : null,
+				},
+				sessionMetrics: { ...sessionMetrics, contextUsage: latestContextUsage ?? null },
 			});
 		}),
 	);
@@ -1254,12 +1803,16 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 			pi.logger.debug("laya tool guard", { tool: event.toolName });
 			const key = `${stateVersion}:${event.toolName}:${digest(event.input)}`;
 			callKeys.set(event.toolCallId, key);
+			const explicitlyNamedRead =
+				event.toolName === "read" &&
+				typeof event.input.path === "string" &&
+				pathExplicitlyNamed(event.input.path, ctx.cwd);
 
 			// Capture the mutation version at command start; only a successful result
 			// can certify work that happened before it began.
 			if (settings.verificationEnabled && event.toolName === "bash" && "command" in event.input) {
 				const command = Reflect.get(event.input, "command");
-				if (typeof command === "string" && VERIFICATION_COMMAND.test(command)) {
+				if (typeof command === "string" && !/[|;&\n\r'"`$<>\\]/.test(command) && VERIFICATION_COMMAND.test(command.trim())) {
 					verificationCalls.set(event.toolCallId, verificationLedger.mutationVersion);
 				}
 			}
@@ -1279,6 +1832,8 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 						status: "Evidence reused",
 						transcript: true,
 					});
+					sessionMetrics.blockedOperations += 1;
+					turnBlockedOperations += 1;
 					return {
 						block: true,
 						reason: repeatedSuccess
@@ -1289,7 +1844,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 			}
 
 			if (
-				settings.economyEnabled &&
+				(settings.economyEnabled || contextPressureActive) &&
 				isBroadExploration(event.toolName, event.input) &&
 				broadExplorationBudget !== undefined
 			) {
@@ -1303,6 +1858,8 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 						status: "Discovery optimized",
 						transcript: true,
 					});
+					sessionMetrics.blockedOperations += 1;
+					turnBlockedOperations += 1;
 					heldBroadExplorations += 1;
 					return {
 						block: true,
@@ -1314,12 +1871,15 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 			}
 
 			if (
-				settings.economyEnabled &&
 				settings.synthesisGuardEnabled &&
+				(settings.economyEnabled || contextPressureActive) &&
 				event.toolName === "read" &&
 				synthesisMode &&
-				synthesisReadCount >= settings.synthesisReadBudget
+				!explicitlyNamedRead &&
+				synthesisReadCount >= effectiveSynthesisReadBudget &&
+				!refusedOnce.has(key)
 			) {
+				refusedOnce.add(key);
 				callKeys.delete(event.toolCallId);
 				recordActivity(ctx, settings, {
 					phase: `synthesis-budget:${event.toolCallId}`,
@@ -1329,11 +1889,13 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 					status: "Synthesis ready",
 					transcript: true,
 				});
+				sessionMetrics.blockedOperations += 1;
+				turnBlockedOperations += 1;
 				heldSynthesisReads += 1;
 				return {
 					block: true,
 					reason:
-						"The evidence budget for this synthesis request is exhausted. Use the inspected material to write the requested document or answer; do not keep reading unrelated files.",
+						"The evidence budget for this synthesis request is reached. Write from the inspected material if it suffices; re-issue this read only if the document needs evidence you have not seen.",
 				};
 			}
 
@@ -1351,6 +1913,8 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 						warning: true,
 						transcript: true,
 					});
+					sessionMetrics.blockedOperations += 1;
+					turnBlockedOperations += 1;
 					return {
 						block: true,
 						reason: `No file at that path. Did you mean one of: ${candidates.join(", ")}?`,
@@ -1358,21 +1922,25 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 				}
 
 				const requestedPath = fixed ?? event.input.path;
-				if (!requestedPath.includes("://") && (settings.economyEnabled || settings.contextPruningEnabled)) {
+				if (!requestedPath.includes("://") && (settings.economyEnabled || settings.contextPruningEnabled || contextPressureActive)) {
 					const selector = splitSelector(requestedPath);
 					const readTarget: ReadTarget = {
 						file: path.resolve(ctx.cwd, selector.file),
-						range: readRange(selector.selector),
+						// A different range is new evidence; only the same selector is a reread.
+						readKey: `${path.resolve(ctx.cwd, selector.file)}${selector.selector}`,
 						stateVersion,
 					};
-					const previousRead = fileReads.get(readTarget.file);
+					const previousRead = fileReads.get(readTarget.readKey);
 					if (
-						settings.economyEnabled &&
+						(settings.economyEnabled || contextPressureActive) &&
 						settings.synthesisGuardEnabled &&
 						synthesisMode &&
+						!pathExplicitlyNamed(requestedPath, ctx.cwd) &&
 						previousRead?.stateVersion === stateVersion &&
-						previousRead.count >= settings.synthesisReadLimit
+						previousRead.count >= effectiveSynthesisReadLimit &&
+						!refusedOnce.has(key)
 					) {
+						refusedOnce.add(key);
 						callKeys.delete(event.toolCallId);
 						recordActivity(ctx, settings, {
 							phase: `synthesis-reread:${event.toolCallId}`,
@@ -1383,10 +1951,12 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 							transcript: true,
 						});
 						heldSynthesisReads += 1;
+						sessionMetrics.blockedOperations += 1;
+						turnBlockedOperations += 1;
 						return {
 							block: true,
 							reason:
-								"This unchanged file has already been inspected enough for the requested synthesis. Use its existing evidence and write the requested document instead of reading it again.",
+								"This exact unchanged read has already run for this synthesis. Use its existing result; re-issue it only if that result is no longer in context.",
 						};
 					}
 					readTargets.set(event.toolCallId, readTarget);
@@ -1408,12 +1978,15 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 			const destructive = DESTRUCTIVE_PREFILTER.test(proposal) && !REGENERABLE_TARGET.test(proposal);
 			const secrets = SECRET_PREFILTER.test(proposal);
 			const changeCandidate = event.toolName === "edit" || event.toolName === "write";
-			const shouldAssess =
-				(settings.securityEnabled && (destructive || secrets)) || (settings.verificationEnabled && changeCandidate);
-			const assessment = shouldAssess ? await assessChange(event.toolName, event.input, ctx, settings) : undefined;
 			const sourceChange =
 				changeCandidate &&
 				/\.(?:[cm]?[jt]sx?|py|go|rs|java|rb|cs|c|cc|cpp|cxx|h|hpp|swift|kt|kts|php)(?:\b|["'])/i.test(proposal);
+			const prefilterHit = settings.securityEnabled && (destructive || secrets);
+			// Source changes already require verification, so a clean one needs no model call.
+			// Laya only confirms prefilter hits; an unprompted classifier hold on an
+			// ordinary edit is a false positive that stalls the agent.
+			const shouldAssess = prefilterHit || (settings.verificationEnabled && changeCandidate && !sourceChange);
+			const assessment = shouldAssess ? await assessChange(event.toolName, event.input, ctx, settings) : undefined;
 			if (changeCandidate && settings.verificationEnabled) {
 				changeAssessments.set(event.toolCallId, {
 					holdReasons: assessment?.holdReasons ?? [],
@@ -1425,7 +1998,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 			const concerns = new Set<string>();
 			if (settings.securityEnabled && destructive) concerns.add("may irreversibly destroy or overwrite data");
 			if (settings.securityEnabled && secrets) concerns.add("may write credentials or personal data");
-			if (settings.securityEnabled) {
+			if (prefilterHit) {
 				for (const reason of assessment?.holdReasons ?? []) concerns.add(reason);
 			}
 			if (concerns.size === 0 || refusedOnce.has(key)) return;
@@ -1441,6 +2014,8 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 				warning: true,
 				transcript: true,
 			});
+			sessionMetrics.blockedOperations += 1;
+			turnBlockedOperations += 1;
 			return {
 				block: true,
 				reason: `Held for confirmation: this operation ${concern}. Confirm the intent with the user, or re-issue it if it is correct.`,
@@ -1460,23 +2035,19 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 			verificationCalls.delete(event.toolCallId);
 			const target = readTargets.get(event.toolCallId);
 			readTargets.delete(event.toolCallId);
-			const tracksEvidence = settings.economyEnabled || settings.contextPruningEnabled;
-			if (key && tracksEvidence) {
+			if (!event.isError && !READ_ONLY_TOOLS[event.toolName]) {
+				stateVersion += 1;
+				repoIndex = undefined;
+			}
+			if (key && (settings.economyEnabled || settings.contextPruningEnabled)) {
 				toolOutcomes.set(key, { failed: event.isError, expiresAt: Date.now() + TOOL_OUTCOME_TTL_MS });
 				if (event.isError) failureCounts.set(key, (failureCounts.get(key) ?? 0) + 1);
-				else {
-					failureCounts.delete(key);
-					if (STATE_CHANGING_TOOLS[event.toolName]) {
-						stateVersion += 1;
-						repoIndex = undefined;
-					}
-				}
+				else failureCounts.delete(key);
 			}
 
 			if (event.isError) return;
 			if (verificationAttempt !== undefined) {
 				const wasPending = isVerificationPending();
-				verificationRanThisTurn = true;
 				verificationLedger = {
 					...verificationLedger,
 					verifiedVersion: Math.max(verificationLedger.verifiedVersion ?? -1, verificationAttempt),
@@ -1491,9 +2062,9 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 					});
 					recordActivity(ctx, settings, {
 						phase: `verification-satisfied:${event.toolCallId}`,
-						title: "Verification satisfied",
-						detail: "A successful check ran after the last behavior-affecting mutation.",
-						status: "Verified",
+						title: "Recognized verification command completed",
+						detail: "A recognized command completed successfully after the last behavior-affecting mutation; inspect its output for the check result.",
+						status: "Verification command completed",
 						transcript: true,
 					});
 				}
@@ -1501,6 +2072,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 			const additions: { type: "text"; text: string }[] = [];
 			const resultText = textOf(event.content);
 			if (assessment && settings.verificationEnabled) {
+				const alreadyPending = isVerificationPending();
 				const mutationVersion = verificationLedger.mutationVersion + 1;
 				const reasons = assessment.sourceChange ? ["source-change"] : ["laya-change-risk"];
 				verificationLedger = {
@@ -1510,7 +2082,6 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 					lastMutation: { version: mutationVersion, tool: event.toolName, reasons },
 				};
 				if (assessment.requiresVerification) {
-					verificationRanThisTurn = false;
 					verificationRequiredThisTurn = isVerificationPending();
 					verificationReasons.clear();
 					for (const reason of reasons) verificationReasons.add(reason);
@@ -1521,61 +2092,38 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 						policyMode: settings.policyMode,
 						timestamp: Date.now(),
 					});
-					additions.push({
-						type: "text",
-						text: "[laya] This completed change likely affects observable behavior. Run the narrowest relevant check before reporting completion.",
-					});
-					recordActivity(ctx, settings, {
-						phase: `verification-required:${event.toolCallId}`,
-						title: "Targeted verification required",
-						detail: `Laya recorded mutation ${mutationVersion}; the harness requires a successful post-mutation check before completion.`,
-						status: "Verification required",
-						transcript: true,
-					});
+					// One notice per pending obligation; repeating it on every edit only spends context.
+					if (!alreadyPending) {
+						additions.push({
+							type: "text",
+							text: "[laya] This completed change likely affects observable behavior. Run the narrowest relevant check before reporting completion.",
+						});
+						recordActivity(ctx, settings, {
+							phase: `verification-required:${event.toolCallId}`,
+							title: "Targeted verification required",
+							detail: `Laya recorded mutation ${mutationVersion}; the harness requires a successful post-mutation check before completion.`,
+							status: "Verification required",
+							transcript: true,
+						});
+					}
 				}
 			}
-			if (target && settings.economyEnabled) {
+			if (target && (settings.economyEnabled || contextPressureActive)) {
 				if (synthesisMode) synthesisReadCount += 1;
-				const previousRead = fileReads.get(target.file);
+				const previousRead = fileReads.get(target.readKey);
 				const stateChanged = previousRead?.stateVersion !== target.stateVersion;
 				const count = stateChanged ? 1 : (previousRead?.count ?? 0) + 1;
-				fileReads.set(target.file, {
+				fileReads.set(target.readKey, {
 					count,
 					nudged: previousRead?.nudged ?? false,
 					stateVersion: target.stateVersion,
 				});
 				if (count >= READ_REREAD_NUDGE && !previousRead?.nudged) {
-					fileReads.set(target.file, { ...fileReads.get(target.file)!, nudged: true });
+					fileReads.set(target.readKey, { ...fileReads.get(target.readKey)!, nudged: true });
 					additions.push({
 						type: "text",
-						text: `[laya] ${target.file} has been read ${count} times in this agent run with no state change in between — its content is already in your context, so proceed instead of re-reading.`,
+						text: `[laya] This exact read of ${target.file} has run ${count} times with no state change in between; reuse an earlier result unless it was compacted away.`,
 					});
-				}
-			}
-			if (target && settings.contextPruningEnabled) {
-				for (const previous of readSnapshots) {
-					const supersedes =
-						previous.file === target.file &&
-						previous.stateVersion === target.stateVersion &&
-						previous.range !== undefined &&
-						target.range !== undefined &&
-						target.range.start <= previous.range.start &&
-						(target.range.end === undefined ||
-							(previous.range.end !== undefined && target.range.end >= previous.range.end));
-					if (!supersedes) continue;
-					if (!supersededReadResults.has(previous.toolCallId)) {
-						prunedReadResults += 1;
-						prunedReadChars += previous.outputChars;
-					}
-					supersededReadResults.set(
-						previous.toolCallId,
-						"[laya] Superseded by a later unchanged read; use that result.",
-					);
-				}
-				readSnapshots.push({ ...target, toolCallId: event.toolCallId, outputChars: resultText.length });
-				while (readSnapshots.length > MAX_TRACKED_READS) {
-					const expired = readSnapshots.shift();
-					if (expired) supersededReadResults.delete(expired.toolCallId);
 				}
 			}
 			if (settings.securityEnabled && INJECTION_PREFILTER.test(resultText)) {
@@ -1597,47 +2145,112 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 		}),
 	);
 
+	/**
+	 * Laya's transcript cards are for the user. The model already receives every
+	 * decision that affects it through tool results and block reasons, so the
+	 * cards are dropped from its context instead of arriving as extra turns.
+	 *
+	 * Pruning only elides an earlier result whose exact content the model still
+	 * sees in a later one; the stub is kept in place so every tool call keeps its
+	 * result. Messages arrive as fresh copies of the session, so decisions are
+	 * recomputed per request and stay byte-stable for the prompt cache.
+	 */
 	pi.on("context", async (event, ctx) =>
 		guarded("context", ctx, async () => {
 			const settings = layaSettings(pi, ctx.cwd);
-			if (!settings.enabled || !settings.contextPruningEnabled) return;
-			const seen = new Set<string>();
-			const retained = [];
+			if (!settings.enabled) return;
+			const messages = event.messages.filter(
+				message => !(message?.role === "custom" && message.customType === LAYA_CARD_TYPE),
+			);
+			const cardsRemoved = messages.length !== event.messages.length;
+			if (!settings.contextPruningEnabled) return cardsRemoved ? { messages } : undefined;
 			let changed = false;
-			for (let index = event.messages.length - 1; index >= 0; index -= 1) {
-				const message = event.messages[index];
-				if (!message || message.role !== "toolResult") {
-					retained.push(message);
-					continue;
+			const laterOutputs = new Set<string>();
+			for (let index = messages.length - 1; index >= 0; index -= 1) {
+				const message = messages[index];
+				if (!message || message.role !== "toolResult") continue;
+				const text = fullTextOf(message.content);
+				if (text === undefined) continue;
+				const outputKey = digest({ toolName: message.toolName, text });
+				let stub: string | undefined;
+				if (text.length >= MIN_PRUNABLE_RESULT_CHARS) {
+					if (laterOutputs.has(outputKey)) {
+						stub = `[laya] Output identical to a later ${message.toolName} result; use that result.`;
+					}
 				}
-				const replacement = supersededReadResults.get(message.toolCallId);
-				if (replacement) {
-					retained.push({ ...message, content: [{ type: "text", text: replacement }] });
+				if (stub) {
+					messages[index] = { ...message, content: [{ type: "text", text: stub }] };
+					recordPrunedOutput(message.toolCallId, text.length);
 					changed = true;
 					continue;
 				}
-				const key = digest({ toolName: message.toolName, content: message.content });
-				if (seen.has(key)) {
-					changed = true;
-					continue;
-				}
-				seen.add(key);
-				retained.push(message);
+				laterOutputs.add(outputKey);
 			}
 
-			if (!changed) return;
+			if (!changed) return cardsRemoved ? { messages } : undefined;
 			if (!surfacedActivities.has("context-pruned")) {
 				recordActivity(ctx, settings, {
 					phase: "context-pruned",
 					title: "Context optimized",
-					detail: "Laya removed duplicated or superseded tool output before the next model call.",
+					detail: "Laya elided tool output whose exact content a later result still carries.",
 					status: "Context optimized",
 					transcript: true,
 				});
 			}
-			return { messages: retained.reverse() };
+			return { messages };
 		}),
 	);
+
+	pi.registerCommand("laya", {
+		description: "Show this session's Laya metrics or skip model/effort recommendations for one turn.",
+		handler: async (args, ctx) => {
+			const command = args.trim().toLowerCase();
+			if (command === "stats") {
+				const usage = latestContextUsage
+					? `${latestContextUsage.tokens.toLocaleString()} / ${latestContextUsage.contextWindow.toLocaleString()} tokens (${Math.round(latestContextUsage.percent)}%; reported context estimate)`
+					: "unavailable";
+				const inferenceAverage =
+					sessionMetrics.inferenceCount > 0
+						? sessionMetrics.inferenceLatencyMs / sessionMetrics.inferenceCount
+						: 0;
+				const report = [
+					"Laya current-session observed metrics",
+					`Completed turns: ${sessionMetrics.turns}`,
+					`Provider input tokens: ${sessionMetrics.providerInputTokens.toLocaleString()}`,
+					`Provider output tokens: ${sessionMetrics.providerOutputTokens.toLocaleString()}`,
+					`Cache read/write tokens: ${sessionMetrics.cacheReadTokens.toLocaleString()} / ${sessionMetrics.cacheWriteTokens.toLocaleString()}`,
+					`Context usage: ${usage}`,
+					`Blocked operations: ${sessionMetrics.blockedOperations}`,
+					`Pruned operations: ${sessionMetrics.prunedOperations}`,
+					`Estimated pruned tokens (pruned output characters ÷ 4): ${sessionMetrics.estimatedPrunedTokens.toLocaleString()}`,
+					`Laya inference latency: ${sessionMetrics.inferenceCount} requests, ${sessionMetrics.inferenceLatencyMs.toFixed(1)} ms total, ${inferenceAverage.toFixed(1)} ms average`,
+					`Model/effort recommendations (advisory, not applied): ${sessionMetrics.routeAssessments} assessments (${sessionMetrics.recommendationsToSmol} @smol, ${sessionMetrics.recommendationsToSlow} @slow, ${sessionMetrics.noRoleRecommendations} without a role change recommendation)`,
+					`Explicit user bypasses: ${sessionMetrics.explicitUserBypasses}${keepModelNextTurn ? " (one pending)" : ""}`,
+				].join("\n");
+				if (ctx.hasUI) ctx.ui.notify(report, "info");
+				return;
+			}
+			if (command === "keep-model") {
+				keepModelNextTurn = true;
+				pi.appendEntry("laya-routing", {
+					decision: "bypass-armed",
+					advisory: true,
+					reason: "User explicitly requested /laya keep-model to skip recommendations for the next agent turn.",
+					timestamp: Date.now(),
+				});
+				const settings = layaSettings(pi, ctx.cwd);
+				recordActivity(ctx, settings, {
+					phase: "route-bypass-armed",
+					title: "Skip model recommendations next turn",
+					detail: "The next agent turn will skip only Laya model/effort recommendations; the active model and effort remain unchanged regardless, and other enabled safeguards remain active.",
+					status: "Recommendation bypass armed",
+				});
+				if (ctx.hasUI) ctx.ui.notify("Laya will skip model/effort recommendations for the next agent turn; it does not change the active model or effort.", "info");
+				return;
+			}
+			if (ctx.hasUI) ctx.ui.notify("Usage: /laya stats | /laya keep-model", "info");
+		},
+	});
 
 	pi.registerTool({
 			name: "laya_analyze",
@@ -1672,7 +2285,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 				}
 
 				try {
-					const result = await requestLaya(text, ANALYSIS_QUESTIONS[mode], signal);
+					const result = await infer(text, ANALYSIS_QUESTIONS[mode], signal);
 					const details: LayaToolDetails = { available: true, mode, result };
 					return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details };
 				} catch (error) {
@@ -1713,7 +2326,7 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 				}
 
 				try {
-					const result = await requestLaya(stateText, { evaluation: { type: "noul", instructions } }, signal);
+					const result = await infer(stateText, { evaluation: { type: "noul", instructions } }, signal);
 					const details: LayaToolDetails = { available: true, result };
 					return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details };
 				} catch (error) {
