@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 from unittest.mock import patch
 
@@ -159,6 +160,45 @@ class LayaOpenAICompatibilityTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["choices"][0]["finish_reason"], "stop")
+
+
+class LayaServiceLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(laya_server.app)
+        self.patches = [
+            patch.object(laya_server, "agent", FakeAgent()),
+            patch.object(laya_server, "IDLE_TIMEOUT_SECONDS", 60.0),
+            patch.object(laya_server, "last_activity", time.monotonic() - 120),
+        ]
+        for active in self.patches:
+            active.start()
+
+    def tearDown(self):
+        for active in self.patches:
+            active.stop()
+
+    def test_health_reports_starting_until_the_checkpoint_loads(self):
+        with patch.object(laya_server, "agent", None), patch.object(laya_server, "device", None):
+            self.assertEqual(self.client.get("/health").json()["status"], "starting")
+        with patch.object(laya_server, "device", "mps"):
+            self.assertEqual(self.client.get("/health").json(), {"status": "ok", "device": "mps"})
+
+    def test_api_requests_reset_the_idle_clock_but_health_checks_do_not(self):
+        self.client.get("/health")
+        self.assertTrue(laya_server.idle_expired(time.monotonic()), "health polling must not keep an idle service alive")
+        self.assertEqual(self.client.get("/v1/models").status_code, 200)
+        self.assertFalse(laya_server.idle_expired(time.monotonic()))
+
+    def test_idle_shutdown_boundaries(self):
+        start = laya_server.last_activity
+        self.assertFalse(laya_server.idle_expired(start + 59.9))
+        self.assertTrue(laya_server.idle_expired(start + 60))
+        with laya_server.prediction_lock:
+            self.assertFalse(laya_server.idle_expired(start + 600), "never exit mid-prediction")
+        with patch.object(laya_server, "agent", None):
+            self.assertFalse(laya_server.idle_expired(start + 600), "never exit while the checkpoint loads")
+        with patch.object(laya_server, "IDLE_TIMEOUT_SECONDS", 0.0):
+            self.assertFalse(laya_server.idle_expired(start + 600), "0 disables idle shutdown")
 
 
 if __name__ == "__main__":

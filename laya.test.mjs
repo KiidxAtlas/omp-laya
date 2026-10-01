@@ -36,7 +36,11 @@ const roleModels = { "@smol": smolModel, "@slow": slowModel };
 let contextUsage;
 let layaConfig = {};
 let failChangePreflight = false;
-let healthUnavailable = false;
+// Nothing listening on the Laya port (fetch rejects like Bun's ConnectionRefused).
+let healthUnreachable = false;
+// Queued /health statuses; "ok" once empty.
+const healthResponses = [];
+let refuseNextPrediction = false;
 const originalFetch = globalThis.fetch;
 const extensionDirectory = fileURLToPath(new URL(".", import.meta.url));
 const originalLayaPython = process.env.LAYA_PYTHON;
@@ -94,8 +98,15 @@ async function prepare(prompt) {
 test("Laya control plane enforces its decision policy", async () => {
 	try {
 		globalThis.fetch = async (url, init) => {
-			if (String(url).endsWith("/health"))
-				return Response.json({ status: healthUnavailable ? "starting" : "ok", device: "test" });
+			if (String(url).endsWith("/health")) {
+				if (healthUnreachable)
+					throw Object.assign(new TypeError("Unable to connect."), { code: "ConnectionRefused" });
+				return Response.json({ status: healthResponses.shift() ?? "ok", device: "test" });
+			}
+			if (refuseNextPrediction) {
+				refuseNextPrediction = false;
+				throw Object.assign(new TypeError("Unable to connect."), { code: "ConnectionRefused" });
+			}
 			const body = JSON.parse(init.body);
 			if (String(url).endsWith("/v1/systemone")) {
 				systemOneRequests.push(body);
@@ -669,12 +680,40 @@ test("Laya control plane enforces its decision policy", async () => {
 			"the master switch must disable Laya analysis tools",
 		);
 		layaConfig = { enabled: true, serviceEnabled: true };
-		healthUnavailable = true;
+		healthUnreachable = true;
 		await emit("session_start", {});
-		healthUnavailable = false;
+		healthUnreachable = false;
 		assert.ok(
 			entries.some(entry => entry.type === "laya-failure" && entry.data.label === "startup"),
 			"an unlaunchable local service must be reported without crashing the host",
+		);
+
+		const requestsBeforeRecovery = requests.length;
+		await emit("input", { text: "first turn after outage" });
+		await new Promise(resolve => setTimeout(resolve, 50));
+		await emit("input", { text: "second turn after outage" });
+		assert.ok(
+			requests.slice(requestsBeforeRecovery).some(request => request.state.input === "second turn after outage"),
+			"advisories must resume once the service answers again instead of staying offline for the session",
+		);
+
+		const startupFailures = entries.filter(entry => entry.type === "laya-failure" && entry.data.label === "startup").length;
+		healthResponses.push("starting", "starting");
+		await emit("session_start", {});
+		assert.equal(healthResponses.length, 0);
+		assert.equal(
+			entries.filter(entry => entry.type === "laya-failure" && entry.data.label === "startup").length,
+			startupFailures,
+			"a service that is still loading must be awaited, not launched again",
+		);
+
+		refuseNextPrediction = true;
+		healthResponses.push("starting");
+		const afterIdleExit = await tools[0].execute("after-idle-exit", { mode: "routing", text: "route easy" });
+		assert.equal(
+			afterIdleExit.details.available,
+			true,
+			"a request that finds the service exited must relaunch it and retry",
 		);
 	} finally {
 		globalThis.fetch = originalFetch;

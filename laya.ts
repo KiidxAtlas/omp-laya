@@ -566,7 +566,8 @@ async function requestLaya(text: string, questions: QuestionSet, signal?: AbortS
 			}
 		} catch (error) {
 			lastError = error;
-			if (attempt === 1 || signal?.aborted) break;
+			// Nothing listening: retrying the same port can't help; callers relaunch.
+			if (attempt === 1 || signal?.aborted || isConnectionRefused(error)) break;
 			await new Promise<void>(resolve => setTimeout(resolve, PREDICTION_RETRY_DELAY_MS));
 		}
 	}
@@ -679,10 +680,35 @@ function choiceOf(result: unknown, key: string): string | undefined {
 		: undefined;
 }
 
+/** The service answered but is still loading its checkpoint. */
+class LayaStartingError extends Error {}
+
+/** True when nothing listens on the Laya port, e.g. after the service's idle shutdown. */
+function isConnectionRefused(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	if ("code" in error && error.code === "ConnectionRefused") return true; // Bun
+	const cause = "cause" in error ? error.cause : undefined;
+	return !!cause && typeof cause === "object" && "code" in cause && cause.code === "ECONNREFUSED"; // Node
+}
+
+/** Await `promise`, rejecting early if `signal` aborts; the promise itself keeps running. */
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) return Promise.reject(signal.reason);
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(signal.reason);
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+	});
+}
+
 async function layaHealth(): Promise<{ device: string }> {
 	const response = await fetch(LAYA_HEALTH_URL, { signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS) });
 	if (!response.ok) throw new Error(`Laya health check failed: HTTP ${response.status}`);
 	const health = await response.json();
+	if (health && typeof health === "object" && "status" in health && health.status === "starting") {
+		throw new LayaStartingError("Laya health check reported a model that is still loading");
+	}
 	if (!health || typeof health !== "object" || !("status" in health) || health.status !== "ok") {
 		throw new Error("Laya health check reported a model that is not ready");
 	}
@@ -754,15 +780,16 @@ let layaStartup: Promise<{ device: string }> | undefined;
 async function ensureLayaReady(): Promise<{ device: string }> {
 	try {
 		return await layaProbe();
-	} catch {
-		if (!layaStartup) {
-			layaStartup = (async () => {
-				await launchLayaProcess();
-				return waitForLayaReady();
-			})().finally(() => {
-				layaStartup = undefined;
-			});
-		}
+	} catch (error) {
+		// A service answering "starting" is already loading, possibly launched by
+		// another omp process; launching again would only lose the port race.
+		const alreadyStarting = error instanceof LayaStartingError;
+		layaStartup ??= (async () => {
+			if (!alreadyStarting) await launchLayaProcess();
+			return waitForLayaReady();
+		})().finally(() => {
+			layaStartup = undefined;
+		});
 		return layaStartup;
 	}
 }
@@ -1136,10 +1163,26 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 	let explicitPathMentions = new Set<string>();
 	const prunedResultIds = new Set<string>();
 
+	/** Relaunch an exited service (idle shutdown, crash) and resume advisories once it answers. */
+	async function recoverLaya(): Promise<void> {
+		const health = await ensureLayaReady();
+		layaOnline = true;
+		layaFailures = 0;
+		pi.logger.info("laya control plane recovered", { device: health.device });
+	}
+
 	async function infer(text: string, questions: QuestionSet, signal?: AbortSignal): Promise<unknown> {
 		const startedAt = performance.now();
 		try {
-			return await requestLaya(text, questions, signal);
+			try {
+				return await requestLaya(text, questions, signal);
+			} catch (error) {
+				if (!isConnectionRefused(error) || signal?.aborted || !layaSettings(pi).serviceEnabled) throw error;
+				// Retry once the relaunch answers if the caller's deadline allows;
+				// otherwise the relaunch completes in the background for later requests.
+				await abortable(recoverLaya(), signal);
+				return await requestLaya(text, questions, signal);
+			}
 		} finally {
 			sessionMetrics.inferenceCount += 1;
 			const elapsedMs = Math.max(0, performance.now() - startedAt);
@@ -1413,6 +1456,8 @@ export default function layaControlPlane(pi: ExtensionAPI) {
 		if (!layaOnline) {
 			pendingEconomy = undefined;
 			setLayaStatus(ctx, settings, "Unavailable");
+			// Advisories resume on a later turn once the relaunch answers.
+			if (settings.serviceEnabled) void recoverLaya().catch(() => undefined);
 			return;
 		}
 		setLayaStatus(ctx, settings, "Classifying turn");

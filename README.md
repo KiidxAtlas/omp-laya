@@ -15,6 +15,14 @@ omp plugin link ~/.omp/agent/plugins/omp-laya
 
 `omp plugin link` symlinks the clone into `~/.omp/plugins/node_modules`, where OMP loads the `omp.extensions` entry from `package.json`. `~/.omp/agent/plugins` itself is not an extension discovery root. Alternatively, `omp plugin install github:KiidxAtlas/omp-laya` installs the published copy; use one method, not both.
 
+## Local service
+
+The extension launches the model server (`laya_server.py`, uvicorn on `127.0.0.1:8001`) on first use and logs to `laya-server.log`. The server outlives OMP sessions, so concurrent sessions share one process of about 3 GB, mostly GPU memory on Apple Silicon.
+
+- After 15 minutes without an API request the server exits to free that memory; `/health` checks don't count. The next Laya request relaunches it, which takes a few seconds. Set `LAYA_IDLE_TIMEOUT_SECONDS` in OMP's environment to change the timeout; `0` keeps the server running.
+- The server claims its port before loading the checkpoint and answers `/health` with `"starting"` meanwhile, so a session that finds it loading waits instead of launching a second copy.
+- A request that finds the server gone relaunches it and retries. If the request's deadline is too short to wait, advisories resume on a later turn.
+
 ## Policy
 
 ```yaml
@@ -79,6 +87,7 @@ providers:
 
 ```bash
 bun test
+~/.omp/agent/laya-venv/bin/python -m unittest laya_server_test
 ```
 
 `LAYA_PYTHON` overrides the default `~/.omp/agent/laya-venv/bin/python`; `PI_CODING_AGENT_DIR` overrides the default agent directory.

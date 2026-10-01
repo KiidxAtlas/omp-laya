@@ -1,21 +1,28 @@
 import json
 import logging
+import os
+import signal
+import threading
 import time
 from contextlib import asynccontextmanager
-from threading import Lock
 from typing import Any, Literal
 
-import laya
-import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-logger = logging.getLogger("laya_service")
+# Child of uvicorn's logger so service events land in laya-server.log.
+logger = logging.getLogger("uvicorn.error.laya")
 agent: Any | None = None
-prediction_lock = Lock()
+device: str | None = None
+prediction_lock = threading.Lock()
 MODEL_ID = "laya"
 CHECKPOINT_ID = "convaiinnovations/laya-typed-decisions"
+# Seconds without an API request (health checks excluded) before the service
+# exits to free its memory (~3 GB, mostly GPU). The omp extension relaunches
+# it on the next request. 0 or less keeps it running.
+IDLE_TIMEOUT_SECONDS = float(os.environ.get("LAYA_IDLE_TIMEOUT_SECONDS", "900"))
+last_activity = time.monotonic()
 
 
 class PredictionRequest(BaseModel):
@@ -42,28 +49,81 @@ class ChatCompletionRequest(BaseModel):
     stream_options: dict[str, Any] | None = None
 
 
-def device_name() -> str:
-    return "mps" if torch.backends.mps.is_available() else "cpu"
+def load_agent() -> None:
+    """Import and load the checkpoint off the startup path.
+
+    uvicorn binds its port only after lifespan startup returns. Loading here
+    instead lets the port bind immediately, so a second launch fails fast on
+    the port (before importing torch) rather than loading a duplicate model,
+    and /health reports "starting" while the checkpoint loads.
+    """
+    global agent, device
+    try:
+        import laya
+        import torch
+
+        selected = "mps" if torch.backends.mps.is_available() else "cpu"
+        logger.info("loading Laya checkpoint %s on %s", CHECKPOINT_ID, selected)
+        loaded = laya.load(CHECKPOINT_ID)
+    except Exception:
+        # Exit so the port frees and the extension's next request relaunches,
+        # instead of serving "starting" forever.
+        logger.exception("Laya checkpoint failed to load; shutting down")
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
+    device = selected
+    agent = loaded
+    logger.info("Laya checkpoint ready on %s", selected)
+
+
+def idle_expired(now: float) -> bool:
+    return (
+        IDLE_TIMEOUT_SECONDS > 0
+        and agent is not None
+        and not prediction_lock.locked()
+        and now - last_activity >= IDLE_TIMEOUT_SECONDS
+    )
+
+
+def watch_idle(stop: threading.Event) -> None:
+    while not stop.wait(min(30.0, IDLE_TIMEOUT_SECONDS)):
+        if idle_expired(time.monotonic()):
+            logger.info("no requests for %ds; shutting down to free memory", IDLE_TIMEOUT_SECONDS)
+            # uvicorn handles SIGTERM as a graceful shutdown.
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global agent
-    logger.info("loading Laya checkpoint %s on %s", CHECKPOINT_ID, device_name())
-    agent = laya.load(CHECKPOINT_ID)
-    logger.info("Laya checkpoint ready")
+    global agent, device
+    threading.Thread(target=load_agent, name="laya-load", daemon=True).start()
+    stop_watchdog = threading.Event()
+    if IDLE_TIMEOUT_SECONDS > 0:
+        threading.Thread(target=watch_idle, args=(stop_watchdog,), name="laya-idle", daemon=True).start()
     try:
         yield
     finally:
+        stop_watchdog.set()
         agent = None
+        device = None
 
 
 app = FastAPI(lifespan=lifespan)
 
 
+@app.middleware("http")
+async def record_activity(request: Request, call_next):
+    # Health checks don't count: only API requests keep the service alive.
+    global last_activity
+    if request.url.path != "/health":
+        last_activity = time.monotonic()
+    return await call_next(request)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok" if agent is not None else "starting", "device": device_name()}
+    return {"status": "ok" if agent is not None else "starting", "device": device or "loading"}
 
 
 @app.get("/v1/models")
