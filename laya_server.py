@@ -17,7 +17,9 @@ agent: Any | None = None
 device: str | None = None
 prediction_lock = threading.Lock()
 MODEL_ID = "laya"
-CHECKPOINT_ID = "convaiinnovations/laya-typed-decisions"
+# A Hugging Face model id or a local checkpoint directory (e.g. one written by
+# laya_finetune.py). An empty value keeps the default.
+CHECKPOINT_ID = os.environ.get("LAYA_CHECKPOINT") or "convaiinnovations/laya-typed-decisions"
 # Seconds without an API request (health checks excluded) before the service
 # exits to free its memory (~3 GB, mostly GPU). The omp extension relaunches
 # it on the next request. 0 or less keeps it running.
@@ -33,6 +35,11 @@ class PredictionRequest(BaseModel):
 class SystemOneRequest(BaseModel):
     model: str | None = None
     state: Any
+    questions: dict[str, dict[str, Any]]
+
+
+class PredictBatchRequest(BaseModel):
+    states: list[Any]
     questions: dict[str, dict[str, Any]]
 
 
@@ -123,7 +130,11 @@ async def record_activity(request: Request, call_next):
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok" if agent is not None else "starting", "device": device or "loading"}
+    return {
+        "status": "ok" if agent is not None else "starting",
+        "device": device or "loading",
+        "checkpoint": CHECKPOINT_ID,
+    }
 
 
 @app.get("/v1/models")
@@ -298,6 +309,21 @@ def predict(request: PredictionRequest) -> Any:
     except Exception as error:
         logger.exception("prediction failed")
         raise HTTPException(status_code=500, detail="Laya prediction failed") from error
+
+
+@app.post("/v1/predict_batch")
+def predict_batch(request: PredictBatchRequest) -> Any:
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Laya model is still starting")
+    if not request.states:
+        raise HTTPException(status_code=400, detail="states must contain at least one state")
+    try:
+        with prediction_lock:
+            # One forward pass per batch instead of one per state; results keep input order.
+            return {"results": agent.predict_batch(request.states, request.questions)}
+    except Exception as error:
+        logger.exception("batch prediction failed")
+        raise HTTPException(status_code=500, detail="Laya batch prediction failed") from error
 
 
 @app.post("/v1/systemone")

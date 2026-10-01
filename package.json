@@ -1,6 +1,6 @@
 {
   "name": "omp-laya",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": false,
   "description": "Local Laya decision-policy extension for Oh My Pi",
   "keywords": [
@@ -13,14 +13,16 @@
   "license": "MIT",
   "files": [
     "laya.ts",
+    "decisions.ts",
     "laya_server.py",
+    "laya_finetune.py",
     "requirements.txt",
     "README.md",
     "LICENSE"
   ],
   "type": "module",
   "scripts": {
-    "test": "bun test ./laya.test.mjs"
+    "test": "bun test"
   },
   "peerDependencies": {
     "@oh-my-pi/pi-ai": ">=18",

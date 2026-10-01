@@ -62,11 +62,49 @@ Clean source edits require verification without an additional classifier request
 
 Automatic verification recognition is deliberately limited to successful direct commands. Quoted commands, pipelines, shell composition, redirects, substitutions, and unrecognized smoke commands do not automatically satisfy the ledger: a shell exit code alone can mask failed checks. Recognized completion is not certification that checks passed; inspect the output. Verification evidence for the current mutation survives later model iterations. Missing recognition is reported as incomplete evidence, not proof that no verification happened.
 
+## Measurement and staged decisions
+
+Laya's checkpoint is fine-tuned on four non-coding workflows, and its confidence is not calibrated. In a hand-labeled probe of this extension's own questions it was strong on `sensitive_data` (8/8) and `prompt_injection` (7/8) but near chance on `difficulty` (0.42) and weak on `retrieval` (0.56). The extension therefore measures every decision before relying on it.
+
+Every Laya answer is appended to `~/.omp/agent/laya/decisions.jsonl` with its question, the raw probabilities, latency, and the answer of a deterministic baseline where one exists (the destructive regex, a path-mention rule, a prompt-length rule). Secrets are redacted and each state is capped at 4,000 characters. The log stays on this machine and rotates at 20 MiB; `laya.decisionLogEnabled: false` turns it off.
+
+Labels come from two sources, and a user label always wins:
+
+- **Outcome labels**, written when an agent run ends, from what the run did: discovery tools used → `retrieval: explore`; tool-call and edited-file counts → `difficulty`; a search candidate the run opened or edited → `relevant`; an optional tool the run used → `tool:<name>`; no shell call at all → `ran: false`. These are proxies, not ground truth.
+- **`/laya label`** walks recent safety and routing decisions (command effect, prompt injection, secrets, claims, retrieval, difficulty) and records your answer.
+
+| Command | Effect |
+|---|---|
+| `/laya eval` | Per question: labeled count, accuracy, majority-class, heuristic, and chance baselines, calibration error (ECE), and a verdict. Writes `eval-report.md`. |
+| `/laya calibrate` | Fits a temperature per question (30+ labels) and keeps it only when it lowers log loss. Answers are logged raw and calibrated before use; a reworded question starts uncalibrated. |
+| `/laya export` | Writes `training.jsonl` and prints the fine-tune command. |
+
+Fine-tuning runs locally (Apple MPS, CUDA, or CPU) with Laya's RLCD recipe, holds out 10% to fit temperatures, and reports held-out accuracy before and after:
+
+```bash
+USE_TF=0 ~/.omp/agent/laya-venv/bin/python laya_finetune.py --data ~/.omp/agent/laya/training.jsonl --out ~/.omp/agent/laya/checkpoint
+```
+
+It refuses fewer than 50 labeled answers unless `--force`. Start OMP with `LAYA_CHECKPOINT=<dir>` to serve the result.
+
+Newer decisions have a mode: `shadow` asks Laya and logs the answer without changing behavior, `on` lets it act, `off` skips it. Move one to `on` after `/laya eval` gives its questions the verdict `beats-baselines`.
+
+| Setting | Default | `on` behavior |
+|---|---|---|
+| `commandCheckMode` | `shadow` | Asks how a shell command the destructive regex did not match affects existing data; `irreversible` holds it once. Regenerable targets (`rm -rf node_modules`) stay exempt. |
+| `injectionScanMode` | `shadow` | Scans `read`, web, and MCP output in up to three windows; a hit the regex missed marks the output as untrusted data. |
+| `searchRelevanceMode` | `shadow` | Scores `grep`/`glob`/`find` hits (6 or more existing files) against the request and appends the most likely files. |
+| `toolRoutingMode` | `off` | For a local model (`toolRoutingLocalOnly`), hides optional tools Laya is confident (p < 0.1) the request will not need; core tools and tools the request names stay, and the full set returns when the run ends. On the stock checkpoint no tool scored that low, so this needs calibration or fine-tuning before it changes anything. |
+
+The change preflight for shell commands also asks the three-way `command_effect` question, which separated destructive from safe commands better than the single `destructive_op` question on hand-labeled commands. The destructive regex now also covers `git checkout -- …`, `git restore`, `git branch -D`, `git stash drop|clear`, `find … -delete`, `aws s3 rm`, `gsutil rm`, `rsync --delete`, `terraform destroy`, and `: > file` / `cat /dev/null > file` truncation.
+
+The verification claim check asks `claim`, `ran`, and `passed` together. Only `claim` drives the warning; `ran` and `passed` are measured against recognized verification commands first.
+
 ## OMP judge integration
 
 The extension registers `laya-systemone/laya` as a custom OMP model. With `modelRoles.judge: laya-systemone/laya`, OMP's `@judge` requests are mapped to typed `choice` and `noul` questions and sent to `POST /v1/systemone`, the native Jev wire contract. `laya/laya` remains the separate OpenAI-compatible chat adapter. The typed path returns JSON score content to OMP; it does not generate prose or tool calls.
 
-The extension requires `laya>=0.3.20,<0.4` and loads `convaiinnovations/laya-typed-decisions` by its Hugging Face model ID. A new server start resolves the checkpoint's current default Hub revision. On the public typed-decisions test split, this installation scored **0.767 accuracy over 2,000 decisions**, versus the published **0.727** for TypeSafe Jev 1.13.0. That measures native typed predictions, not the chat adapter or your private judge prompts.
+The extension requires `laya>=0.3.20,<0.4` and loads `convaiinnovations/laya-typed-decisions` by its Hugging Face model ID unless `LAYA_CHECKPOINT` names another Hub ID or a local checkpoint directory. A new server start resolves the checkpoint's current default Hub revision. On the public typed-decisions test split, this installation scored **0.767 accuracy over 2,000 decisions**, versus the published **0.727** for TypeSafe Jev 1.13.0. That measures native typed predictions, not the chat adapter or your private judge prompts.
 
 To list the separate OpenAI chat adapter as a regular model:
 
@@ -87,7 +125,7 @@ providers:
 
 ```bash
 bun test
-~/.omp/agent/laya-venv/bin/python -m unittest laya_server_test
+~/.omp/agent/laya-venv/bin/python -m unittest laya_server_test laya_finetune_test
 ```
 
-`LAYA_PYTHON` overrides the default `~/.omp/agent/laya-venv/bin/python`; `PI_CODING_AGENT_DIR` overrides the default agent directory.
+`LAYA_PYTHON` overrides the default `~/.omp/agent/laya-venv/bin/python`; `PI_CODING_AGENT_DIR` overrides the default agent directory; `LAYA_DATA_DIR` moves the decision log, calibration, and exports (the tests use a temporary directory).

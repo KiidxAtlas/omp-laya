@@ -34,6 +34,16 @@ class FakeAgent:
             "usage": {"input_tokens": 13, "output_tokens": 0},
         }
 
+    def predict_batch(self, states, questions):
+        return [
+            {
+                "model": "laya-rl-agent",
+                "answers": {qid: {"type": "noul", "noul": 0.9 if "rm" in state else 0.1} for qid in questions},
+                "usage": {"input_tokens": len(state), "output_tokens": 0},
+            }
+            for state in states
+        ]
+
 
 class LayaOpenAICompatibilityTests(unittest.TestCase):
     def setUp(self):
@@ -181,7 +191,14 @@ class LayaServiceLifecycleTests(unittest.TestCase):
         with patch.object(laya_server, "agent", None), patch.object(laya_server, "device", None):
             self.assertEqual(self.client.get("/health").json()["status"], "starting")
         with patch.object(laya_server, "device", "mps"):
-            self.assertEqual(self.client.get("/health").json(), {"status": "ok", "device": "mps"})
+            self.assertEqual(
+                self.client.get("/health").json(),
+                {"status": "ok", "device": "mps", "checkpoint": laya_server.CHECKPOINT_ID},
+            )
+
+    def test_health_reports_the_configured_checkpoint(self):
+        with patch.object(laya_server, "CHECKPOINT_ID", "/models/laya-ft"):
+            self.assertEqual(self.client.get("/health").json()["checkpoint"], "/models/laya-ft")
 
     def test_api_requests_reset_the_idle_clock_but_health_checks_do_not(self):
         self.client.get("/health")
@@ -199,6 +216,51 @@ class LayaServiceLifecycleTests(unittest.TestCase):
             self.assertFalse(laya_server.idle_expired(start + 600), "never exit while the checkpoint loads")
         with patch.object(laya_server, "IDLE_TIMEOUT_SECONDS", 0.0):
             self.assertFalse(laya_server.idle_expired(start + 600), "0 disables idle shutdown")
+
+
+class LayaBatchPredictionTests(unittest.TestCase):
+    QUESTIONS = {"destructive": {"type": "noul", "instructions": "Does the command delete data?"}}
+
+    def setUp(self):
+        self.client = TestClient(laya_server.app)
+        self.agent_patch = patch.object(laya_server, "agent", FakeAgent())
+        self.agent_patch.start()
+
+    def tearDown(self):
+        self.agent_patch.stop()
+
+    def test_returns_one_result_per_state_in_request_order(self):
+        response = self.client.post(
+            "/v1/predict_batch",
+            json={"states": ["ls -la", "rm -rf build", "cat notes.txt"], "questions": self.QUESTIONS},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        results = response.json()["results"]
+        self.assertEqual([r["answers"]["destructive"]["noul"] for r in results], [0.1, 0.9, 0.1])
+        self.assertEqual([r["usage"]["input_tokens"] for r in results], [6, 12, 13])
+
+    def test_rejects_requests_while_the_checkpoint_loads(self):
+        with patch.object(laya_server, "agent", None):
+            response = self.client.post("/v1/predict_batch", json={"states": ["ls"], "questions": self.QUESTIONS})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Laya model is still starting")
+
+    def test_rejects_an_empty_batch(self):
+        response = self.client.post("/v1/predict_batch", json={"states": [], "questions": self.QUESTIONS})
+        self.assertEqual(response.status_code, 400)
+
+    def test_reports_model_failures_as_server_errors(self):
+        with patch.object(FakeAgent, "predict_batch", side_effect=RuntimeError("boom")), \
+                self.assertLogs("uvicorn.error.laya", level="ERROR"):
+            response = self.client.post("/v1/predict_batch", json={"states": ["ls"], "questions": self.QUESTIONS})
+        self.assertEqual(response.status_code, 500)
+
+    def test_batch_requests_keep_the_service_alive(self):
+        with patch.object(laya_server, "IDLE_TIMEOUT_SECONDS", 60.0), \
+                patch.object(laya_server, "last_activity", time.monotonic() - 120):
+            self.client.post("/v1/predict_batch", json={"states": ["ls"], "questions": self.QUESTIONS})
+            self.assertFalse(laya_server.idle_expired(time.monotonic()))
 
 
 if __name__ == "__main__":
